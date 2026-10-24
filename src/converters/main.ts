@@ -1,0 +1,394 @@
+import fs from "node:fs";
+import path from "node:path";
+
+import { Cookie } from "elysia";
+
+import db from "../db/db";
+import { MAX_CONVERT_PROCESS } from "../helpers/env";
+import { normalizeFiletype, normalizeOutputFiletype } from "../helpers/normalizeFiletype";
+import { convert as convertassimp, properties as propertiesassimp } from "./assimp";
+import { convert as convertCalibre, properties as propertiesCalibre } from "./calibre";
+import { convert as convertDasel, properties as propertiesDasel } from "./dasel";
+import { convert as convertDjvu, properties as propertiesDjvu } from "./djvu";
+import { convert as convertDvisvgm, properties as propertiesDvisvgm } from "./dvisvgm";
+import { convert as convertFFmpeg, properties as propertiesFFmpeg } from "./ffmpeg";
+import {
+  convert as convertGraphicsmagick,
+  properties as propertiesGraphicsmagick,
+} from "./graphicsmagick";
+import { convert as convertImagemagick, properties as propertiesImagemagick } from "./imagemagick";
+import { convert as convertInkscape, properties as propertiesInkscape } from "./inkscape";
+import { convert as convertLibheif, properties as propertiesLibheif } from "./libheif";
+import { convert as convertLibjxl, properties as propertiesLibjxl } from "./libjxl";
+import { convert as convertLibreOffice, properties as propertiesLibreOffice } from "./libreoffice";
+import { convert as convertMarkitdown, properties as propertiesMarkitdown } from "./markitdown";
+import { convert as convertMsgconvert, properties as propertiesMsgconvert } from "./msgconvert";
+import { convert as convertPandoc, properties as propertiesPandoc } from "./pandoc";
+import { convert as convertPdftops, properties as propertiesPdftops } from "./pdftops";
+import { convert as convertPotrace, properties as propertiesPotrace } from "./potrace";
+import { convert as convertresvg, properties as propertiesresvg } from "./resvg";
+import { convert as convertVcf, properties as propertiesVcf } from "./vcf";
+import { convert as convertImage, properties as propertiesImage } from "./vips";
+import { convert as convertVtracer, properties as propertiesVtracer } from "./vtracer";
+import { convert as convertxelatex, properties as propertiesxelatex } from "./xelatex";
+
+// This should probably be reconstructed so that the functions are not imported instead the functions hook into this to make the converters more modular
+
+const properties: Record<
+  string,
+  {
+    properties: {
+      from: Record<string, string[]>;
+      to: Record<string, string[]>;
+      options?: Record<
+        string,
+        Record<
+          string,
+          {
+            description: string;
+            type: string;
+            default: number;
+          }
+        >
+      >;
+    };
+    converter: (
+      filePath: string,
+      fileType: string,
+      convertTo: string,
+      targetPath: string,
+
+      options?: unknown,
+    ) => unknown;
+  }
+> = {
+  // Prioritize Inkscape for EMF files as it handles them better than ImageMagick
+  inkscape: {
+    properties: propertiesInkscape,
+    converter: convertInkscape,
+  },
+  libjxl: {
+    properties: propertiesLibjxl,
+    converter: convertLibjxl,
+  },
+  resvg: {
+    properties: propertiesresvg,
+    converter: convertresvg,
+  },
+  vips: {
+    properties: propertiesImage,
+    converter: convertImage,
+  },
+  libheif: {
+    properties: propertiesLibheif,
+    converter: convertLibheif,
+  },
+  xelatex: {
+    properties: propertiesxelatex,
+    converter: convertxelatex,
+  },
+  // djvu before calibre so the dedicated ddjvu converter wins for DjVu files
+  djvu: {
+    properties: propertiesDjvu,
+    converter: convertDjvu,
+  },
+  calibre: {
+    properties: propertiesCalibre,
+    converter: convertCalibre,
+  },
+  dasel: {
+    properties: propertiesDasel,
+    converter: convertDasel,
+  },
+  libreoffice: {
+    properties: propertiesLibreOffice,
+    converter: convertLibreOffice,
+  },
+  pandoc: {
+    properties: propertiesPandoc,
+    converter: convertPandoc,
+  },
+  msgconvert: {
+    properties: propertiesMsgconvert,
+    converter: convertMsgconvert,
+  },
+  dvisvgm: {
+    properties: propertiesDvisvgm,
+    converter: convertDvisvgm,
+  },
+  imagemagick: {
+    properties: propertiesImagemagick,
+    converter: convertImagemagick,
+  },
+  graphicsmagick: {
+    properties: propertiesGraphicsmagick,
+    converter: convertGraphicsmagick,
+  },
+  assimp: {
+    properties: propertiesassimp,
+    converter: convertassimp,
+  },
+  ffmpeg: {
+    properties: propertiesFFmpeg,
+    converter: convertFFmpeg,
+  },
+  potrace: {
+    properties: propertiesPotrace,
+    converter: convertPotrace,
+  },
+  vtracer: {
+    properties: propertiesVtracer,
+    converter: convertVtracer,
+  },
+  vcf: {
+    properties: propertiesVcf,
+    converter: convertVcf,
+  },
+  markitDown: {
+    properties: propertiesMarkitdown,
+    converter: convertMarkitdown,
+  },
+  pdftops: {
+    properties: propertiesPdftops,
+    converter: convertPdftops,
+  },
+};
+
+function chunks<T>(arr: T[], size: number): T[][] {
+  if (size <= 0) {
+    return [arr];
+  }
+  return Array.from({ length: Math.ceil(arr.length / size) }, (_: T, i: number) =>
+    arr.slice(i * size, i * size + size),
+  );
+}
+
+export async function handleConvert(
+  fileNames: string[],
+  userUploadsDir: string,
+  userOutputDir: string,
+  convertTo: string,
+  converterName: string,
+  jobId: Cookie<string | undefined>,
+) {
+  const query = db.query(
+    "INSERT INTO file_names (job_id, file_name, output_file_name, status) VALUES (?1, ?2, ?3, ?4)",
+  );
+
+  for (const chunk of chunks(fileNames, MAX_CONVERT_PROCESS)) {
+    const toProcess: Promise<string>[] = [];
+    for (const fileName of chunk) {
+      const filePath = `${userUploadsDir}${fileName}`;
+      const fileTypeOrig = fileName.includes(".") ? (fileName.split(".").pop() ?? "") : "";
+      const fileType = normalizeFiletype(fileTypeOrig);
+      const newFileExt = normalizeOutputFiletype(convertTo);
+      let newFileName: string;
+      if (fileTypeOrig === "") {
+        newFileName = `${fileName}.${newFileExt}`;
+      } else {
+        newFileName = fileName.replace(
+          new RegExp(`${fileTypeOrig}(?!.*${fileTypeOrig})`),
+          newFileExt,
+        );
+      }
+      const targetPath = `${userOutputDir}${newFileName}`;
+      toProcess.push(
+        new Promise((resolve, reject) => {
+          mainConverter(filePath, fileType, convertTo, targetPath, {}, converterName)
+            .then((r) => {
+              if (jobId.value) {
+                const dir = path.dirname(targetPath);
+                const parsed = path.parse(targetPath);
+
+                const outputFiles = fs
+                  .readdirSync(dir)
+                  .filter((f) => {
+                    if (f === parsed.base) {
+                      return true;
+                    }
+
+                    return (
+                      f.startsWith(`${parsed.name}-`) &&
+                      f.endsWith(parsed.ext) &&
+                      /^\d+$/.test(f.slice(parsed.name.length + 1, -parsed.ext.length))
+                    );
+                  })
+                  .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+
+                if (outputFiles.length > 0) {
+                  for (const outputFile of outputFiles) {
+                    query.run(jobId.value, fileName, outputFile, r);
+                  }
+                } else {
+                  query.run(jobId.value, fileName, newFileName, r);
+                }
+              }
+              resolve(r);
+            })
+            .catch((c) => reject(c));
+        }),
+      );
+    }
+    await Promise.all(toProcess);
+  }
+}
+
+async function mainConverter(
+  inputFilePath: string,
+  fileTypeOriginal: string,
+  convertTo: string,
+  targetPath: string,
+  options?: unknown,
+  converterName?: string,
+) {
+  const fileType = normalizeFiletype(fileTypeOriginal);
+
+  let converterFunc: (typeof properties)["libjxl"]["converter"] | undefined;
+
+  if (converterName) {
+    converterFunc = properties[converterName]?.converter;
+  } else {
+    // Iterate over each converter in properties
+    for (const name in properties) {
+      const converterObj = properties[name];
+
+      if (!converterObj) {
+        break;
+      }
+
+      for (const key in converterObj.properties.from) {
+        if (
+          converterObj?.properties?.from[key]?.includes(fileType) &&
+          converterObj?.properties?.to[key]?.includes(convertTo)
+        ) {
+          converterFunc = converterObj.converter;
+          converterName = name;
+          break;
+        }
+      }
+      if (converterFunc) {
+        break;
+      }
+    }
+  }
+
+  if (!converterFunc) {
+    console.log(`No available converter supports converting from ${fileType} to ${convertTo}.`);
+    return "File type not supported";
+  }
+
+  try {
+    const result = await converterFunc(inputFilePath, fileType, convertTo, targetPath, options);
+
+    console.log(
+      `Converted ${inputFilePath} from ${fileType} to ${convertTo} successfully using ${converterName}.`,
+      result,
+    );
+
+    if (typeof result === "string") {
+      return result;
+    }
+
+    return "Done";
+  } catch (error) {
+    console.error(
+      `Failed to convert ${inputFilePath} from ${fileType} to ${convertTo} using ${converterName}.`,
+      error,
+    );
+    return "Failed, check logs";
+  }
+}
+
+const possibleTargets: Record<string, Record<string, string[]>> = {};
+
+for (const converterName in properties) {
+  const converterProperties = properties[converterName]?.properties;
+
+  if (!converterProperties) continue;
+
+  for (const key in converterProperties.from) {
+    const fromList = converterProperties.from[key];
+    const toList = converterProperties.to[key];
+
+    if (!fromList || !toList) continue;
+
+    for (const ext of fromList) {
+      if (!possibleTargets[ext]) possibleTargets[ext] = {};
+
+      possibleTargets[ext][converterName] = [...toList];
+    }
+  }
+}
+
+export const getPossibleTargets = (from: string): Record<string, string[]> => {
+  const fromClean = normalizeFiletype(from);
+
+  return possibleTargets[fromClean] || {};
+};
+
+const possibleInputs: string[] = [];
+for (const converterName in properties) {
+  const converterProperties = properties[converterName]?.properties;
+
+  if (!converterProperties) continue;
+
+  for (const key in converterProperties.from) {
+    for (const extension of converterProperties.from[key] ?? []) {
+      if (!possibleInputs.includes(extension)) {
+        possibleInputs.push(extension);
+      }
+    }
+  }
+}
+possibleInputs.sort();
+
+const allTargets: Record<string, string[]> = {};
+
+for (const converterName in properties) {
+  const converterProperties = properties[converterName]?.properties;
+
+  if (!converterProperties) continue;
+
+  for (const key in converterProperties.to) {
+    if (allTargets[converterName]) {
+      allTargets[converterName] = [
+        ...allTargets[converterName],
+        ...(converterProperties.to[key] || []),
+      ];
+    } else {
+      allTargets[converterName] = [...(converterProperties.to[key] || [])];
+    }
+  }
+}
+
+export const getAllTargets = () => {
+  return allTargets;
+};
+
+const allInputs: Record<string, string[]> = {};
+for (const converterName in properties) {
+  const converterProperties = properties[converterName]?.properties;
+
+  if (!converterProperties) continue;
+
+  for (const key in converterProperties.from) {
+    if (allInputs[converterName]) {
+      allInputs[converterName] = [
+        ...allInputs[converterName],
+        ...(converterProperties.from[key] || []),
+      ];
+    } else {
+      allInputs[converterName] = converterProperties.from[key] || [];
+    }
+  }
+}
+
+export const getAllInputs = (converter: string) => {
+  return allInputs[converter] || [];
+};
+
+/**
+ * @internal For testing only. Do not use in production.
+ * Tests need direct access to cover all branches of converter discovery and chunking logic.
+ */
+export { chunks, mainConverter };

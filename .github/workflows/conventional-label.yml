@@ -1,0 +1,26 @@
+name: autolabel
+on:
+  pull_request_target:
+    types: [opened, edited]
+
+permissions:
+  pull-requests: write
+
+jobs:
+  label:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: c4illin/autolabel@main
+        with:
+          type_labels: |
+            feat: Feature
+            fix: Fix
+            docs: Docs
+            style: Style
+            refactor: Refactor
+            perf: Performance
+            test: Test
+            build: Build
+            ci: CI
+            revert: Revert
+            breaking: Breaking
